@@ -13,10 +13,10 @@ final class SpaceHarrierSaverView: ScreenSaverView {
     private var cameraZ: CGFloat = 0
     private var worldZ: CGFloat = 0 // unwrapped forward distance for sprites
     private let tileSize: CGFloat = 0.60
-    private let speed: CGFloat = 0.09
+    private let speed: CGFloat = 0.065
     private let zBias: CGFloat = -4 // shift plane along Z axis (negative = closer)
 
-    private let objectSpeedMult: CGFloat = 1.35 // objects advance faster than ground
+    private let objectSpeedMult: CGFloat = 1.15 // objects advance faster than ground
     private var nextIsBush: Bool = true         // alternate spawn kind
     private let harrierZ: CGFloat = 1.25        // just in front of camera
     private let harrierBasePx: CGFloat = 120    // base pixel height
@@ -57,7 +57,7 @@ final class SpaceHarrierSaverView: ScreenSaverView {
     private lazy var glowGradient: NSGradient? = NSGradient(starting: horizonGlow, ending: .clear)
 
     private enum SpriteKind { case bush, column, shot }
-    private struct Sprite { var kind: SpriteKind; var x: CGFloat; var z: CGFloat; var size: CGFloat; var y: CGFloat }
+    private struct Sprite { var kind: SpriteKind; var x: CGFloat; var z: CGFloat; var size: CGFloat; var y: CGFloat; var age: Int }
 
     private var sprites: [Sprite] = []
     private var imgBush: NSImage? = NSImage(named: "bush") // optional, falls back to vector
@@ -66,10 +66,12 @@ final class SpaceHarrierSaverView: ScreenSaverView {
     private var imgParticle: NSImage? = NSImage(named: "particle")
     private lazy var ciContext = CIContext(options: nil)
     private var ciParticle: CIImage?
-    
+    private var cachedHueParticle: CGImage? = nil
+    private var cachedHueParity: Int = -1
+    private lazy var hueFilter = CIFilter(name: "CIHueAdjust")
     private var lastTick: CFTimeInterval = CACurrentMediaTime()
     private var smoothedDt: CGFloat = 1.0 / 60.0
-    private let dtSmoothAlpha: CGFloat = 0.25 // EMA factor for dt smoothing (higher = snappier)
+    private let dtSmoothAlpha: CGFloat = 0.22 // EMA smoothing (lower = smoother)
 
     private var triedLoadImages = false
 
@@ -108,7 +110,7 @@ final class SpaceHarrierSaverView: ScreenSaverView {
 
     // Spawn tuning
     private let maxSprites = 6            // legacy (not used for obstacles anymore)
-    private let maxObstacles = 6          // bushes + columns budget (excludes shots)
+    private let maxObstacles = 5          // bushes + columns budget (excludes shots)
     private let spawnDistance: CGFloat = 68 // farther so they start tiny; higher speed brings them in fast
     private let laneWidth: CGFloat = 2.0 // wider lanes for more horizontal spread
 
@@ -120,13 +122,19 @@ final class SpaceHarrierSaverView: ScreenSaverView {
     private let emptyRowChance: UInt32 = 25 // % chance to skip a row for occasional gaps
 
     // Shots (turbo fire)
-    private let maxShots = 24
+    private let maxShots = 12
     private var shotFrameCounter = 0
     private var shotCooldown = 0
-    private let shotSpeed: CGFloat = 3.6 // faster so they shrink/exit quicker
-    private let shotCooldownFrames = 25 // one shot every 2 frames (~30/s)
-    private let shotRelMin: CGFloat = 0.60  // start a bit farther from Harrier
-    private let shotRelMax: CGFloat = 1.20  // allow visible zoom-out travel
+    private let shotRelNetSpeed: CGFloat = 0.030 // net relative-Z gain per frame → guaranteed zoom-out
+    private let shotCooldownFrames = 25 // keep user’s cadence
+    private let shotRelMin: CGFloat = 0.55  // spawn close to Harrier but visible
+    private let shotRelMax: CGFloat = 1.60  // finish sooner so zoom-out reads clearly
+    private let shotDriftStart: CGFloat = 0.00   // start drifting to center immediately
+    private let shotDriftEnd:   CGFloat = 0.90   // reach center before end of life
+    private let shotFollowLerp: CGFloat = 0.56  // track Harrier tightly
+
+    // Hue cache optimization
+    private let hueFrames: Int = 6 // update hue every 6 frames
 
     override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview)
@@ -168,12 +176,12 @@ final class SpaceHarrierSaverView: ScreenSaverView {
         let now = CACurrentMediaTime()
         var dt = now - lastTick
         lastTick = now
-        // clamp dt to avoid spikes from OS scheduling
+        // clamp unreasonable spikes
         if dt < (1.0/240.0) { dt = 1.0/240.0 }
         if dt > (1.0/20.0)  { dt = 1.0/20.0 }
-        // exponential moving average to stabilize motion
+        // exponential moving average for stability
         smoothedDt += (CGFloat(dt) - smoothedDt) * dtSmoothAlpha
-        let fscale = smoothedDt * 60.0 // scale to 60fps units so existing speeds make sense
+        let fscale = smoothedDt * 60.0 // normalize to 60fps units
         // --- end Smooth delta-time ---
         cameraZ += speed * fscale
         worldZ += speed * objectSpeedMult * fscale
@@ -183,7 +191,7 @@ final class SpaceHarrierSaverView: ScreenSaverView {
         let despawnZ: CGFloat = 0.45
         sprites.removeAll { spr in
             let relZ: CGFloat = spr.z - worldZ + (spr.kind == .shot ? 0 : zBias)
-            return relZ < despawnZ || (spr.kind == .shot && relZ > spawnDistance * 0.95)
+            return relZ < despawnZ || (spr.kind == .shot && (relZ > spawnDistance * 0.95 || spr.age > 300))
         }
 
         // Initialize row marker once
@@ -214,15 +222,19 @@ final class SpaceHarrierSaverView: ScreenSaverView {
         let ySpan = rect.height * 0.20
         let xPix = centerX + harrierNormX * xSpan
         let yPix = centerY + harrierNormY * ySpan
+        let muzzleOffsetX = rect.width * 0.012   // ~1.2% of width to the right (farther gap)
+        let muzzleOffsetY = rect.height * 0.024  // ~2.4% of height upward
+        let xPixMuzzle = xPix + muzzleOffsetX
+        let yPixMuzzle = yPix + muzzleOffsetY
 
         if shotCooldown == 0 {
-            // Spawn just ahead of Harrier in Z, and compute world X from Harrier’s actual world plane
+            // Spawn just ahead of Harrier in Z, and compute world X from Harrier’s muzzle offset
             let zRelStart: CGFloat = shotRelMin
             let scaleAtShot = focal / zRelStart
-            let worldX = (xPix - centerX) / scaleAtShot
+            let worldX = (xPixMuzzle - centerX) / scaleAtShot
 
             if sprites.filter({ $0.kind == .shot }).count < maxShots {
-                let s = Sprite(kind: .shot, x: worldX, z: worldZ + zRelStart, size: 0.20, y: yPix)
+                let s = Sprite(kind: .shot, x: worldX, z: worldZ + zRelStart, size: 0.20, y: yPixMuzzle, age: 0)
                 sprites.append(s)
                 shotCooldown = shotCooldownFrames
             }
@@ -232,22 +244,58 @@ final class SpaceHarrierSaverView: ScreenSaverView {
         if !sprites.isEmpty {
             for i in 0..<sprites.count {
                 if sprites[i].kind == .shot {
-                    // Move away from camera (increase relative Z)
-                    let currentRel = sprites[i].z - worldZ
-                    let nextRel = currentRel + shotSpeed
-                    sprites[i].z = worldZ + nextRel
+                    sprites[i].age += 1
+                    // Advance absolute Z by world step + net zoom speed so relative Z always grows
+                    let worldStep = speed * objectSpeedMult * fscale
+                    sprites[i].z += worldStep + shotRelNetSpeed * fscale
 
-                    // Ease X toward world X = 0. The farther it is, the faster it recenters.
-                    // progress = 0 at spawn (shotRelMin), ~1 around shotRelMax
+                    // Clamp to the travel window in relative-Z
+                    var rel = sprites[i].z - worldZ
+                    if rel < shotRelMin {
+                        rel = shotRelMin
+                        sprites[i].z = worldZ + rel
+                    }
+                    if rel > shotRelMax {
+                        rel = shotRelMax
+                        sprites[i].z = worldZ + rel
+                    }
+
+                    // Progress 0..1 based on depth window
                     let span = max(0.001, shotRelMax - shotRelMin)
-                    let progress = min(1.0, max(0.0, (nextRel - shotRelMin) / span))
-                    let lerpBase: CGFloat = 0.02
-                    let lerpGain: CGFloat = 0.06
-                    let lerp = lerpBase + lerpGain * progress
-                    sprites[i].x += (0 - sprites[i].x) * lerp
+                    let t = min(1.0, max(0.0, (rel - shotRelMin) / span))
 
-                    // Keep Y at its spawn anchor so it doesn't sit inside Harrier
-                    // (no per-frame Y tracking)
+                    // Hold near Harrier first, then start drifting to center after shotDriftStart..shotDriftEnd
+                    let driftPhase = (t - shotDriftStart) / max(0.001, (shotDriftEnd - shotDriftStart))
+                    let drift = max(0.0, min(1.0, driftPhase))
+                    let driftSmoothed = drift * drift * (3 - 2 * drift) // smoothstep
+
+                    // Target in screen space
+                    let targetSX = xPixMuzzle * (1 - driftSmoothed) + centerX * driftSmoothed
+                    let targetSY = yPixMuzzle * (1 - driftSmoothed) + centerY * driftSmoothed
+
+                    // Convert screen X to world X at current depth
+                    let zRel = max(0.001, sprites[i].z - worldZ)
+                    let s = focal / zRel
+                    let desiredWorldX = (targetSX - centerX) / s
+
+                    // Smoothly chase the target; if we fall far behind in screen space, snap closer
+                    let k = shotFollowLerp
+                    // current screen position of the shot (for snap test)
+                    let curS = focal / max(0.001, zRel)
+                    let curSX = centerX + sprites[i].x * curS
+                    let curSY = sprites[i].y
+                    let dx = targetSX - curSX
+                    let dy = targetSY - curSY
+                    let dist = sqrt(dx*dx + dy*dy)
+                    let snapThreshold: CGFloat = max(12.0, self.bounds.width * 0.01) // ~1% width or 12px
+                    if dist > snapThreshold {
+                        // snap most of the way to avoid visible lag
+                        sprites[i].x = sprites[i].x + (desiredWorldX - sprites[i].x) * max(k, 0.9)
+                        sprites[i].y = sprites[i].y + (targetSY - sprites[i].y) * max(k, 0.9)
+                    } else {
+                        sprites[i].x += (desiredWorldX - sprites[i].x) * k
+                        sprites[i].y += (targetSY - sprites[i].y) * k
+                    }
                 }
             }
         }
@@ -354,7 +402,7 @@ final class SpaceHarrierSaverView: ScreenSaverView {
     private func spawnSprite() {
         let kind: SpriteKind = (arc4random_uniform(100) < 75) ? .bush : .column
         let size: CGFloat = (kind == .bush) ? 0.9 : 1.2
-        let s = Sprite(kind: kind, x: randomLaneX(), z: worldZ + spawnDistance, size: size, y: 0)
+        let s = Sprite(kind: kind, x: randomLaneX(), z: worldZ + spawnDistance, size: size, y: 0, age: 0)
         sprites.append(s)
     }
 
@@ -397,7 +445,8 @@ final class SpaceHarrierSaverView: ScreenSaverView {
                              x: CGFloat(lane) * laneWidth,
                              z: z,
                              size: (kind == .bush ? 0.40 : 0.65) * sizeJitter,
-                             y: 0)
+                             y: 0,
+                             age: 0)
             sprites.append(spr)
             spawned += 1
             laneNextAllowedZ[lane] = z + laneMinSpacing
@@ -441,8 +490,8 @@ final class SpaceHarrierSaverView: ScreenSaverView {
         let zNear = max(0.01, focal / denom)
 
         var kStart = Int(floor((cameraZ + zNear - zBias) / tileSize))
-        let maxBands = 110
-        let minBandPx: CGFloat = 2.0
+        let maxBands = 90
+        let minBandPx: CGFloat = 2.3
         let overlapPx: CGFloat = 0.75 // small vertical overlap to hide seams
         let skirtPx: CGFloat = 12.0 // extend near edge below the screen to avoid pop
 
@@ -592,7 +641,7 @@ final class SpaceHarrierSaverView: ScreenSaverView {
 
             // Base pixel size and caps per kind
             let basePxShot: CGFloat = 6
-            let maxWShot: CGFloat = rect.height * 0.08
+            let maxWShot: CGFloat = rect.height * 0.3
             let basePxOther: CGFloat = 8
             let maxWOther: CGFloat = rect.height * 0.30
 
@@ -670,19 +719,26 @@ final class SpaceHarrierSaverView: ScreenSaverView {
             return za > zb
         }
 
-        // Fast hue-shifted particle image per frame
+        // Hue-shifted particle image (cached) — reduce CI work by updating every `hueFrames` frames
         let tNow = CGFloat(CACurrentMediaTime())
         var cgHuedParticle: CGImage? = nil
+        let parity = shotFrameCounter % hueFrames
         if let ci = ciParticle {
-            let hueAngle = Float((tNow * 8.0).truncatingRemainder(dividingBy: 6.28318530718))
-            if let hueFilter = CIFilter(name: "CIHueAdjust") {
-                hueFilter.setValue(ci, forKey: kCIInputImageKey)
-                hueFilter.setValue(hueAngle, forKey: kCIInputAngleKey)
-                if let out = hueFilter.outputImage {
-                    cgHuedParticle = ciContext.createCGImage(out, from: out.extent)
+            if parity != cachedHueParity {
+                if let hf = hueFilter {
+                    let hueAngle = Float((tNow * 3.0).truncatingRemainder(dividingBy: 6.28318530718))
+                    hf.setValue(ci, forKey: kCIInputImageKey)
+                    hf.setValue(hueAngle, forKey: kCIInputAngleKey)
+                    if let out = hf.outputImage {
+                        cachedHueParticle = ciContext.createCGImage(out, from: out.extent)
+                        cachedHueParity = parity
+                    }
                 }
             }
+            cgHuedParticle = cachedHueParticle
         }
+
+        let spinAngle = CGFloat(tNow * 6.0)
 
         let scaleFactor = backingScale()
         for spr in ordered {
@@ -697,10 +753,11 @@ final class SpaceHarrierSaverView: ScreenSaverView {
             // Shots draw at their anchored screen Y (spawned)
             let groundY: CGFloat = spr.y
 
-            // Size for shots (bigger, tight cap)
-            let basePxShot: CGFloat = 12
-            let maxWShot: CGFloat = rect.height * 0.12
-            let w = min(maxWShot, max(4, basePxShot * spr.size * scale))
+            // Size for shots — explicit 1/z mapping so shrink is obvious
+            let minWShot: CGFloat = 9
+            let maxWShot: CGFloat = rect.height * 0.16
+            let kShot: CGFloat = maxWShot * shotRelMin // when z == shotRelMin, width hits max cap
+            let w = max(minWShot, min(maxWShot, kShot / z))
             let h = w // square particle
             let spriteRect = snapRect(x: screenX - w/2, y: groundY, w: w, h: h, scale: scaleFactor)
 
@@ -709,6 +766,14 @@ final class SpaceHarrierSaverView: ScreenSaverView {
             let fogEnd: CGFloat = spawnDistance * 1.1
             var alpha: CGFloat = 1.0
             if z > fogStart { alpha = max(0.0, 1.0 - (z - fogStart) / max(0.001, fogEnd - fogStart)) }
+            // Additional fade once the shot has reached the center (past drift end)
+            let spanT = max(0.001, shotRelMax - shotRelMin)
+            let zRelShot = z // shots ignore zBias here
+            let tShot = min(1.0, max(0.0, (zRelShot - shotRelMin) / spanT))
+            if tShot > shotDriftEnd {
+                let fade = max(0.0, 1.0 - (tShot - shotDriftEnd) / max(0.001, 1.0 - shotDriftEnd))
+                alpha *= fade
+            }
             if alpha <= 0 { continue }
 
             // Draw shot bitmap spinning with fast hue shift
@@ -716,7 +781,7 @@ final class SpaceHarrierSaverView: ScreenSaverView {
                 NSGraphicsContext.saveGraphicsState()
                 let cx = spriteRect.midX
                 let cy = spriteRect.midY
-                let angle = CGFloat(tNow * 12.0)
+                let angle = spinAngle
                 let tx = NSAffineTransform()
                 tx.translateX(by: cx, yBy: cy)
                 tx.rotate(byRadians: angle)
@@ -729,7 +794,7 @@ final class SpaceHarrierSaverView: ScreenSaverView {
                 NSGraphicsContext.saveGraphicsState()
                 let cx = spriteRect.midX
                 let cy = spriteRect.midY
-                let angle = CGFloat(tNow * 12.0)
+                let angle = spinAngle
                 let tx = NSAffineTransform()
                 tx.translateX(by: cx, yBy: cy)
                 tx.rotate(byRadians: angle)
@@ -742,7 +807,7 @@ final class SpaceHarrierSaverView: ScreenSaverView {
                 NSGraphicsContext.saveGraphicsState()
                 let cx = spriteRect.midX
                 let cy = spriteRect.midY
-                let angle = CGFloat(tNow * 12.0)
+                let angle = spinAngle
                 let tx = NSAffineTransform()
                 tx.translateX(by: cx, yBy: cy)
                 tx.rotate(byRadians: angle)
