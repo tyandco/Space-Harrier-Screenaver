@@ -13,10 +13,10 @@ final class SpaceHarrierSaverView: ScreenSaverView {
     private var cameraZ: CGFloat = 0
     private var worldZ: CGFloat = 0 // unwrapped forward distance for sprites
     private let tileSize: CGFloat = 0.60
-    private let speed: CGFloat = 0.065
+    private let speed: CGFloat = 0.09
     private let zBias: CGFloat = -4 // shift plane along Z axis (negative = closer)
 
-    private let objectSpeedMult: CGFloat = 1.15 // objects advance faster than ground
+    private let objectSpeedMult: CGFloat = 1.55 // objects advance faster than ground
     private var nextIsBush: Bool = true         // alternate spawn kind
     private let harrierZ: CGFloat = 1.25        // just in front of camera
     private let harrierBasePx: CGFloat = 120    // base pixel height
@@ -486,7 +486,7 @@ final class SpaceHarrierSaverView: ScreenSaverView {
 
         // Compute the nearest Z that maps to the bottom of the screen
         let bottomY = rect.minY
-        let denom = max(1.0, (horizonY - bottomY))
+        let denom = max(CGFloat(1.0), (horizonY - bottomY))
         let zNear = max(0.01, focal / denom)
 
         var kStart = Int(floor((cameraZ + zNear - zBias) / tileSize))
@@ -497,6 +497,8 @@ final class SpaceHarrierSaverView: ScreenSaverView {
 
         let bright = NSColor(calibratedRed: 0.78, green: 1, blue: 0.74, alpha: 1.0)
         let dark   = NSColor(calibratedRed: 0.6, green: 0.78, blue: 0.57, alpha: 1.0)
+        let cg = NSGraphicsContext.current?.cgContext
+        var cgQuad = CGMutablePath()
 
         // Probe forward to find the farthest band still below the horizon
         var kProbe = kStart
@@ -517,7 +519,6 @@ final class SpaceHarrierSaverView: ScreenSaverView {
         // Precompute horizontal cull bounds and reusable path
         let minX = rect.minX - 2
         let maxX = rect.maxX + 2
-        let quadPath = NSBezierPath()
         while k >= kStart && bandsDrawn < maxBands {
             // Depth band between two successive world tile edges (near zA, far zB)
             let zA = CGFloat(k + 1) * tileSize - cameraZ + zBias // nearer edge with bias
@@ -537,7 +538,7 @@ final class SpaceHarrierSaverView: ScreenSaverView {
             // Projected tile widths at near/far edges
             let wNear = focal * tileSize / zA
             let wFar  = focal * tileSize / zB
-            let halfCols = Int(ceil(rect.width / max(1.0, wNear))) / 2 + 4
+            let halfCols = Int(ceil(rect.width / max(CGFloat(1.0), wNear))) / 2 + 4
 
             for xi in (-halfCols)...halfCols {
                 let leftNear  = centerX + CGFloat(xi) * wNear
@@ -555,19 +556,29 @@ final class SpaceHarrierSaverView: ScreenSaverView {
                 let isBright = ((k + xi) & 1) == 0
                 (isBright ? bright : dark).setFill()
 
-                var yBotClamped = min(yBot - skirtPx, rect.minY - skirtPx) // push slightly below the bottom so it fully exits
+                var yBotClamped = min(yBot - skirtPx, rect.minY - skirtPx)
                 var yTopClamped = min(max(yTop, rect.minY), horizonY)
-
-                // Add a little overlap for non-nearest bands so seams never show
                 if k > kStart { yTopClamped += overlapPx }
 
-                quadPath.removeAllPoints()
-                quadPath.move(to: NSPoint(x: leftNear,  y: yBotClamped))
-                quadPath.line(to: NSPoint(x: rightNear, y: yBotClamped))
-                quadPath.line(to: NSPoint(x: rightFar,  y: yTopClamped))
-                quadPath.line(to: NSPoint(x: leftFar,   y: yTopClamped))
-                quadPath.close()
-                quadPath.fill()
+                if let cg = cg {
+                    cgQuad = CGMutablePath()
+                    cgQuad.move(to: CGPoint(x: leftNear,  y: yBotClamped))
+                    cgQuad.addLine(to: CGPoint(x: rightNear, y: yBotClamped))
+                    cgQuad.addLine(to: CGPoint(x: rightFar,  y: yTopClamped))
+                    cgQuad.addLine(to: CGPoint(x: leftFar,   y: yTopClamped))
+                    cgQuad.closeSubpath()
+                    cg.addPath(cgQuad)
+                    cg.setFillColor((isBright ? bright : dark).cgColor)
+                    cg.fillPath()
+                } else {
+                    let quadPath = NSBezierPath()
+                    quadPath.move(to: NSPoint(x: leftNear,  y: yBotClamped))
+                    quadPath.line(to: NSPoint(x: rightNear, y: yBotClamped))
+                    quadPath.line(to: NSPoint(x: rightFar,  y: yTopClamped))
+                    quadPath.line(to: NSPoint(x: leftFar,   y: yTopClamped))
+                    quadPath.close()
+                    quadPath.fill()
+                }
             }
 
             k -= 1
@@ -614,71 +625,73 @@ final class SpaceHarrierSaverView: ScreenSaverView {
 
         let scaleFactor = backingScale()
         for spr in ordered {
-            // For shots, their depth ignores zBias so they shrink as they move away from the camera.
-            let z = spr.z - worldZ + (spr.kind == .shot ? 0 : zBias)
-            if z <= 0.001 { continue }
+            autoreleasepool {
+                // For shots, their depth ignores zBias so they shrink as they move away from the camera.
+                let z = spr.z - worldZ + (spr.kind == .shot ? 0 : zBias)
+                if z <= 0.001 { return }
 
-            let scale = focal / z
-            let scaleAdj = pow(scale, scaleGamma)
+                let scale = focal / z
+                let scaleAdj = pow(scale, scaleGamma)
 
-            var screenX = centerX + spr.x * scale
-            // Keep center clear for obstacles only (do NOT push shots)
-            if spr.kind != .shot {
-                let deadZonePx: CGFloat = rect.width * 0.06 // ~6% of width on each side of center
-                let dx = screenX - centerX
-                if abs(dx) < deadZonePx {
-                    let pushDir: CGFloat = (dx == 0) ? 1 : (dx > 0 ? 1 : -1)
-                    screenX = centerX + pushDir * deadZonePx
+                var screenX = centerX + spr.x * scale
+                // Keep center clear for obstacles only (do NOT push shots)
+                if spr.kind != .shot {
+                    let deadZonePx: CGFloat = rect.width * 0.06 // ~6% of width on each side of center
+                    let dx = screenX - centerX
+                    if abs(dx) < deadZonePx {
+                        let pushDir: CGFloat = (dx == 0) ? 1 : (dx > 0 ? 1 : -1)
+                        screenX = centerX + pushDir * deadZonePx
+                    }
                 }
-            }
 
-            let groundY: CGFloat
-            if spr.kind == .shot {
-                groundY = spr.y
-            } else {
-                groundY = y(fromZ: z, horizonY: horizonY, focal: focal) - (objPitchPx / z) - objYOffsetPx // lower on screen
-            }
-
-            // Base pixel size and caps per kind
-            let basePxShot: CGFloat = 6
-            let maxWShot: CGFloat = rect.height * 0.3
-            let basePxOther: CGFloat = 8
-            let maxWOther: CGFloat = rect.height * 0.30
-
-            let isShot = (spr.kind == .shot)
-            let basePx = isShot ? basePxShot : basePxOther
-            let maxW = isShot ? maxWShot : maxWOther
-            let w = min(maxW, max(4, basePx * spr.size * (isShot ? scale : scaleAdj)))
-            let h = w * ((spr.kind == .column) ? 1.6 : (isShot ? 1.0 : 0.9))
-            let spriteRect = snapRect(x: screenX - w/2, y: groundY, w: w, h: h, scale: scaleFactor)
-
-            // Simple fog toward the horizon
-            let fogStart: CGFloat = spawnDistance * 0.5
-            let fogEnd: CGFloat = spawnDistance * 1.1
-            var alpha: CGFloat = 1.0
-            if z > fogStart { alpha = max(0.0, 1.0 - (z - fogStart) / max(0.001, fogEnd - fogStart)) }
-
-            if alpha <= 0 { continue }
-
-            NSGraphicsContext.saveGraphicsState()
-
-            if spr.kind == .bush, let img = imgBush {
-                img.draw(in: spriteRect, from: .zero, operation: .sourceOver, fraction: alpha, respectFlipped: true, hints: nil)
-            } else if spr.kind == .column, let img = imgColumn {
-                img.draw(in: spriteRect, from: .zero, operation: .sourceOver, fraction: alpha, respectFlipped: true, hints: nil)
-            } else {
-                // Vector fallback for bushes/columns
-                if spr.kind == .bush {
-                    let p = NSBezierPath(ovalIn: spriteRect)
-                    NSColor(calibratedRed: 0.22, green: 0.85, blue: 0.38, alpha: alpha).setFill()
-                    p.fill()
+                let groundY: CGFloat
+                if spr.kind == .shot {
+                    groundY = spr.y
                 } else {
-                    let p = NSBezierPath(roundedRect: spriteRect, xRadius: w*0.08, yRadius: w*0.08)
-                    NSColor(calibratedRed: 0.75, green: 0.75, blue: 0.82, alpha: alpha).setFill()
-                    p.fill()
+                    groundY = y(fromZ: z, horizonY: horizonY, focal: focal) - (objPitchPx / z) - objYOffsetPx // lower on screen
                 }
+
+                // Base pixel size and caps per kind
+                let basePxShot: CGFloat = 6
+                let maxWShot: CGFloat = rect.height * 0.3
+                let basePxOther: CGFloat = 8
+                let maxWOther: CGFloat = rect.height * 0.30
+
+                let isShot = (spr.kind == .shot)
+                let basePx = isShot ? basePxShot : basePxOther
+                let maxW = isShot ? maxWShot : maxWOther
+                let w = min(maxW, max(4, basePx * spr.size * (isShot ? scale : scaleAdj)))
+                let h = w * ((spr.kind == .column) ? 1.6 : (isShot ? 1.0 : 0.9))
+                let spriteRect = snapRect(x: screenX - w/2, y: groundY, w: w, h: h, scale: scaleFactor)
+
+                // Simple fog toward the horizon
+                let fogStart: CGFloat = spawnDistance * 0.5
+                let fogEnd: CGFloat = spawnDistance * 1.1
+                var alpha: CGFloat = 1.0
+                if z > fogStart { alpha = max(0.0, 1.0 - (z - fogStart) / max(0.001, fogEnd - fogStart)) }
+
+                if alpha <= 0 { return }
+
+                NSGraphicsContext.saveGraphicsState()
+
+                if spr.kind == .bush, let img = imgBush {
+                    img.draw(in: spriteRect, from: .zero, operation: .sourceOver, fraction: alpha, respectFlipped: true, hints: nil)
+                } else if spr.kind == .column, let img = imgColumn {
+                    img.draw(in: spriteRect, from: .zero, operation: .sourceOver, fraction: alpha, respectFlipped: true, hints: nil)
+                } else {
+                    // Vector fallback for bushes/columns
+                    if spr.kind == .bush {
+                        let p = NSBezierPath(ovalIn: spriteRect)
+                        NSColor(calibratedRed: 0.22, green: 0.85, blue: 0.38, alpha: alpha).setFill()
+                        p.fill()
+                    } else {
+                        let p = NSBezierPath(roundedRect: spriteRect, xRadius: w*0.08, yRadius: w*0.08)
+                        NSColor(calibratedRed: 0.75, green: 0.75, blue: 0.82, alpha: alpha).setFill()
+                        p.fill()
+                    }
+                }
+                NSGraphicsContext.restoreGraphicsState()
             }
-            NSGraphicsContext.restoreGraphicsState()
         }
     }
 
@@ -742,80 +755,74 @@ final class SpaceHarrierSaverView: ScreenSaverView {
 
         let scaleFactor = backingScale()
         for spr in ordered {
-            let z = spr.z - worldZ
-            if z <= 0.001 { continue }
+            autoreleasepool {
+                let z = spr.z - worldZ
+                if z <= 0.001 { return }
 
-            let scale = focal / z
-            // Shots use linear scale for a clear shrink
-            var screenX = centerX + spr.x * scale
-            // Shots are allowed at center; no dead-zone push
+                let scale = focal / z
+                // Shots use linear scale for a clear shrink
+                var screenX = centerX + spr.x * scale
+                // Shots are allowed at center; no dead-zone push
 
-            // Shots draw at their anchored screen Y (spawned)
-            let groundY: CGFloat = spr.y
+                // Shots draw at their anchored screen Y (spawned)
+                let groundY: CGFloat = spr.y
 
-            // Size for shots — explicit 1/z mapping so shrink is obvious
-            let minWShot: CGFloat = 9
-            let maxWShot: CGFloat = rect.height * 0.16
-            let kShot: CGFloat = maxWShot * shotRelMin // when z == shotRelMin, width hits max cap
-            let w = max(minWShot, min(maxWShot, kShot / z))
-            let h = w // square particle
-            let spriteRect = snapRect(x: screenX - w/2, y: groundY, w: w, h: h, scale: scaleFactor)
+                // Size for shots — explicit 1/z mapping so shrink is obvious
+                let minWShot: CGFloat = 9
+                let maxWShot: CGFloat = rect.height * 0.16
+                let kShot: CGFloat = maxWShot * shotRelMin // when z == shotRelMin, width hits max cap
+                let w = max(minWShot, min(maxWShot, kShot / z))
+                let h = w // square particle
+                let spriteRect = snapRect(x: screenX - w/2, y: groundY, w: w, h: h, scale: scaleFactor)
 
-            // Fog/alpha
-            let fogStart: CGFloat = spawnDistance * 0.5
-            let fogEnd: CGFloat = spawnDistance * 1.1
-            var alpha: CGFloat = 1.0
-            if z > fogStart { alpha = max(0.0, 1.0 - (z - fogStart) / max(0.001, fogEnd - fogStart)) }
-            // Additional fade once the shot has reached the center (past drift end)
-            let spanT = max(0.001, shotRelMax - shotRelMin)
-            let zRelShot = z // shots ignore zBias here
-            let tShot = min(1.0, max(0.0, (zRelShot - shotRelMin) / spanT))
-            if tShot > shotDriftEnd {
-                let fade = max(0.0, 1.0 - (tShot - shotDriftEnd) / max(0.001, 1.0 - shotDriftEnd))
-                alpha *= fade
-            }
-            if alpha <= 0 { continue }
+                // Fog/alpha
+                let fogStart: CGFloat = spawnDistance * 0.5
+                let fogEnd: CGFloat = spawnDistance * 1.1
+                var alpha: CGFloat = 1.0
+                if z > fogStart { alpha = max(0.0, 1.0 - (z - fogStart) / max(0.001, fogEnd - fogStart)) }
+                // Additional fade once the shot has reached the center (past drift end)
+                let spanT = max(0.001, shotRelMax - shotRelMin)
+                let zRelShot = z // shots ignore zBias here
+                let tShot = min(1.0, max(0.0, (zRelShot - shotRelMin) / spanT))
+                if tShot > shotDriftEnd {
+                    let fade = max(0.0, 1.0 - (tShot - shotDriftEnd) / max(0.001, 1.0 - shotDriftEnd))
+                    alpha *= fade
+                }
+                if alpha <= 0 { return }
 
-            // Draw shot bitmap spinning with fast hue shift
-            if let cgimg = cgHuedParticle {
-                NSGraphicsContext.saveGraphicsState()
-                let cx = spriteRect.midX
-                let cy = spriteRect.midY
-                let angle = spinAngle
-                let tx = NSAffineTransform()
-                tx.translateX(by: cx, yBy: cy)
-                tx.rotate(byRadians: angle)
-                tx.translateX(by: -cx, yBy: -cy)
-                tx.concat()
-                if let ctx = NSGraphicsContext.current?.cgContext { ctx.setAlpha(alpha) }
-                NSGraphicsContext.current?.cgContext.draw(cgimg, in: spriteRect)
-                NSGraphicsContext.restoreGraphicsState()
-            } else if let img = imgParticle {
-                NSGraphicsContext.saveGraphicsState()
-                let cx = spriteRect.midX
-                let cy = spriteRect.midY
-                let angle = spinAngle
-                let tx = NSAffineTransform()
-                tx.translateX(by: cx, yBy: cy)
-                tx.rotate(byRadians: angle)
-                tx.translateX(by: -cx, yBy: -cy)
-                tx.concat()
-                img.draw(in: spriteRect, from: .zero, operation: .sourceOver, fraction: alpha, respectFlipped: true, hints: nil)
-                NSGraphicsContext.restoreGraphicsState()
-            } else {
-                // Vector fallback
-                NSGraphicsContext.saveGraphicsState()
-                let cx = spriteRect.midX
-                let cy = spriteRect.midY
-                let angle = spinAngle
-                let tx = NSAffineTransform()
-                tx.translateX(by: cx, yBy: cy)
-                tx.rotate(byRadians: angle)
-                tx.translateX(by: -cx, yBy: -cy)
-                tx.concat()
-                NSColor.white.setFill()
-                NSBezierPath(rect: spriteRect).fill()
-                NSGraphicsContext.restoreGraphicsState()
+                // Draw shot bitmap spinning with fast hue shift
+                if let cgimg = cgHuedParticle {
+                    if let cg = NSGraphicsContext.current?.cgContext {
+                        cg.saveGState()
+                        cg.translateBy(x: spriteRect.midX, y: spriteRect.midY)
+                        cg.rotate(by: spinAngle)
+                        cg.translateBy(x: -spriteRect.midX, y: -spriteRect.midY)
+                        cg.setAlpha(alpha)
+                        cg.draw(cgimg, in: spriteRect)
+                        cg.restoreGState()
+                    }
+                } else if let img = imgParticle {
+                    if let cg = NSGraphicsContext.current?.cgContext {
+                        cg.saveGState()
+                        cg.translateBy(x: spriteRect.midX, y: spriteRect.midY)
+                        cg.rotate(by: spinAngle)
+                        cg.translateBy(x: -spriteRect.midX, y: -spriteRect.midY)
+                        cg.setAlpha(alpha)
+                    }
+                    img.draw(in: spriteRect, from: .zero, operation: .sourceOver, fraction: alpha, respectFlipped: true, hints: nil)
+                    if let cg = NSGraphicsContext.current?.cgContext { cg.restoreGState() }
+                } else {
+                    // Vector fallback
+                    if let cg = NSGraphicsContext.current?.cgContext {
+                        cg.saveGState()
+                        cg.translateBy(x: spriteRect.midX, y: spriteRect.midY)
+                        cg.rotate(by: spinAngle)
+                        cg.translateBy(x: -spriteRect.midX, y: -spriteRect.midY)
+                    }
+                    NSColor.white.setFill()
+                    NSBezierPath(rect: spriteRect).fill()
+                    if let cg = NSGraphicsContext.current?.cgContext { cg.restoreGState() }
+                }
             }
         }
     }
@@ -834,7 +841,7 @@ final class SpaceHarrierSaverView: ScreenSaverView {
         let h = min(maxH, max(24, h0))
         let w: CGFloat
         if let img = imgHarrier {
-            let ar = img.size.width / max(1.0, img.size.height)
+            let ar = img.size.width / max(CGFloat(1.0), img.size.height)
             w = h * ar
         } else {
             w = h * 0.75 // fallback aspect
