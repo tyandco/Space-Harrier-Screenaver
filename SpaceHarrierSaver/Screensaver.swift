@@ -55,6 +55,9 @@ final class SpaceHarrierSaverView: ScreenSaverView {
     
     private lazy var skyGradient: NSGradient? = NSGradient(starting: skyTop, ending: skyBottom)
     private lazy var glowGradient: NSGradient? = NSGradient(starting: horizonGlow, ending: .clear)
+    // Cached sky bitmap (re-render only when size changes)
+    private var cachedSkySize: NSSize = .zero
+    private var cachedSkyImage: NSImage? = nil
 
     private enum SpriteKind { case bush, column, shot }
     private struct Sprite { var kind: SpriteKind; var x: CGFloat; var z: CGFloat; var size: CGFloat; var y: CGFloat; var age: Int }
@@ -122,7 +125,7 @@ final class SpaceHarrierSaverView: ScreenSaverView {
     private let emptyRowChance: UInt32 = 25 // % chance to skip a row for occasional gaps
 
     // Shots (turbo fire)
-    private let maxShots = 12
+    private let maxShots = 10
     private var shotFrameCounter = 0
     private var shotCooldown = 0
     private let shotRelNetSpeed: CGFloat = 0.030 // net relative-Z gain per frame → guaranteed zoom-out
@@ -134,7 +137,7 @@ final class SpaceHarrierSaverView: ScreenSaverView {
     private let shotFollowLerp: CGFloat = 0.56  // track Harrier tightly
 
     // Hue cache optimization
-    private let hueFrames: Int = 6 // update hue every 6 frames
+    private let hueFrames: Int = 8 // update hue every 8 frames
 
     override init?(frame: NSRect, isPreview: Bool) {
         super.init(frame: frame, isPreview: isPreview)
@@ -455,19 +458,26 @@ final class SpaceHarrierSaverView: ScreenSaverView {
     }
 
     private func drawSky(in rect: NSRect, horizonY: CGFloat) {
-        // Sky gradient (top to just above horizon)
-        let skyOverlap: CGFloat = 12.0 // extend well below the horizon
-        let skyRect = NSRect(x: rect.minX, y: max(rect.minY, horizonY - (rect.height * 0.25) - skyOverlap), width: rect.width, height: rect.maxY - max(rect.minY, horizonY - (rect.height * 0.25) - skyOverlap))
-        if let grad = skyGradient {
-            grad.draw(in: skyRect, angle: 90)
-        } else {
-            skyTop.setFill(); skyRect.fill()
+        if cachedSkyImage == nil || cachedSkySize != rect.size {
+            cachedSkySize = rect.size
+            let img = NSImage(size: rect.size)
+            img.lockFocus()
+            // Sky gradient (top to just above horizon)
+            let skyOverlap: CGFloat = 12.0 // extend well below the horizon
+            let skyRect = NSRect(x: rect.minX, y: max(rect.minY, horizonY - (rect.height * 0.25) - skyOverlap), width: rect.width, height: rect.maxY - max(rect.minY, horizonY - (rect.height * 0.25) - skyOverlap))
+            if let grad = skyGradient {
+                grad.draw(in: skyRect, angle: 90)
+            } else {
+                skyTop.setFill(); skyRect.fill()
+            }
+            // Horizon glow band (soft fade)
+            let glowHeight = rect.height * 0.06
+            let glowRect = NSRect(x: rect.minX, y: max(rect.minY, horizonY - glowHeight - skyOverlap), width: rect.width, height: glowHeight + skyOverlap)
+            glowGradient?.draw(in: glowRect, angle: 90)
+            img.unlockFocus()
+            cachedSkyImage = img
         }
-
-        // Horizon glow band (soft fade)
-        let glowHeight = rect.height * 0.06
-        let glowRect = NSRect(x: rect.minX, y: max(rect.minY, horizonY - glowHeight - skyOverlap), width: rect.width, height: glowHeight + skyOverlap)
-        glowGradient?.draw(in: glowRect, angle: 90)
+        cachedSkyImage?.draw(in: rect)
     }
 
     // MARK: - Retro ground with proper Space Harrier-style perspective
@@ -490,7 +500,7 @@ final class SpaceHarrierSaverView: ScreenSaverView {
         let zNear = max(0.01, focal / denom)
 
         var kStart = Int(floor((cameraZ + zNear - zBias) / tileSize))
-        let maxBands = 90
+        let maxBands = 80
         let minBandPx: CGFloat = 2.3
         let overlapPx: CGFloat = 0.75 // small vertical overlap to hide seams
         let skirtPx: CGFloat = 12.0 // extend near edge below the screen to avoid pop
@@ -679,15 +689,32 @@ final class SpaceHarrierSaverView: ScreenSaverView {
                 } else if spr.kind == .column, let img = imgColumn {
                     img.draw(in: spriteRect, from: .zero, operation: .sourceOver, fraction: alpha, respectFlipped: true, hints: nil)
                 } else {
-                    // Vector fallback for bushes/columns
-                    if spr.kind == .bush {
-                        let p = NSBezierPath(ovalIn: spriteRect)
-                        NSColor(calibratedRed: 0.22, green: 0.85, blue: 0.38, alpha: alpha).setFill()
-                        p.fill()
+                    // Vector fallback for bushes/columns using CG to reduce allocations
+                    if let cg = NSGraphicsContext.current?.cgContext {
+                        cg.saveGState()
+                        cg.setAlpha(alpha)
+                        if spr.kind == .bush {
+                            cg.addEllipse(in: spriteRect)
+                            cg.setFillColor(NSColor(calibratedRed: 0.22, green: 0.85, blue: 0.38, alpha: alpha).cgColor)
+                            cg.fillPath()
+                        } else {
+                            let r = spriteRect
+                            let rr = min(w*0.08, min(r.width, r.height) * 0.25)
+                            let path = CGPath(roundedRect: r, cornerWidth: rr, cornerHeight: rr, transform: nil)
+                            cg.addPath(path)
+                            cg.setFillColor(NSColor(calibratedRed: 0.75, green: 0.75, blue: 0.82, alpha: alpha).cgColor)
+                            cg.fillPath()
+                        }
+                        cg.restoreGState()
                     } else {
-                        let p = NSBezierPath(roundedRect: spriteRect, xRadius: w*0.08, yRadius: w*0.08)
-                        NSColor(calibratedRed: 0.75, green: 0.75, blue: 0.82, alpha: alpha).setFill()
-                        p.fill()
+                        // Fallback if no CG context
+                        if spr.kind == .bush {
+                            let p = NSBezierPath(ovalIn: spriteRect)
+                            NSColor(calibratedRed: 0.22, green: 0.85, blue: 0.38, alpha: alpha).setFill(); p.fill()
+                        } else {
+                            let p = NSBezierPath(roundedRect: spriteRect, xRadius: w*0.08, yRadius: w*0.08)
+                            NSColor(calibratedRed: 0.75, green: 0.75, blue: 0.82, alpha: alpha).setFill(); p.fill()
+                        }
                     }
                 }
                 NSGraphicsContext.restoreGraphicsState()
